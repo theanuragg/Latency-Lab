@@ -1,0 +1,44 @@
+# docker/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'local-dev'
+
+# ─── Alerting rules ──────────────────────────────────────────────────────────
+# These fire during experiments to give early warning before auto-rollback triggers
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Chaos control plane metrics
+  - job_name: 'chaos-control-plane'
+    static_configs:
+      - targets: ['control-plane:3000']
+    metrics_path: '/metrics'
+
+  # Chaos engine metrics
+  - job_name: 'chaos-engine'
+    static_configs:
+      - targets: ['chaos-engine:9091']
+
+  # RPC proxy metrics (tracks injected fault counts)
+  - job_name: 'rpc-proxy'
+    static_configs:
+      - targets: ['rpc-proxy:9092']
+
+  # Kubernetes service discovery (in production)
+  # - job_name: 'kubernetes-pods'
+  #   kubernetes_sd_configs:
+  #     - role: pod
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  #       action: keep
+  #       regex: true
+
+  # Mock target service (replace with your actual services)
+  - job_name: 'mock-services'
+    static_configs:
+      - targets: ['mock-solana:9100']
+    metrics_path: '/metrics'

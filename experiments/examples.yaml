@@ -1,0 +1,202 @@
+# ─── Example 1: Solana RPC latency chaos ─────────────────────────────────────
+# The most important experiment for Solana infra.
+# Tests whether your application handles slow RPC responses gracefully
+# (proper timeouts, fallback nodes, retry with backoff).
+experiment:
+  name: "solana-rpc-latency-chaos"
+  description: "Simulate slow Solana RPC responses to test client timeout handling"
+  type: "rpc-latency"
+  target:
+    rpcEndpoints:
+      - "http://solana-rpc-1.internal:8899"
+      - "http://solana-rpc-2.internal:8899"
+  action:
+    type: "rpc-latency"
+    latencyMs: 500
+    jitterMs: 200
+    errorRate: 0.3  # Apply to 30% of requests
+  blastRadius:
+    unit: "percentage"
+    value: 50  # Affect 50% of RPC endpoints
+  duration: "10m"
+  safety:
+    requireHealthyBefore: true
+    requireHealthyAfter: true
+    maxErrorRatePct: 10
+    maxLatencyMs: 2000
+    autoRollback: true
+    recoveryTimeoutSeconds: 120
+
+---
+# ─── Example 2: Pod kill with rolling chaos ──────────────────────────────────
+# Tests whether your services restart cleanly and whether your load balancer
+# removes pods from rotation fast enough to avoid dropped requests.
+experiment:
+  name: "api-pod-rolling-kill"
+  description: "Rolling termination of API pods to test restart resilience"
+  type: "pod-kill"
+  target:
+    namespace: "production"
+    labelSelector:
+      app: "api-server"
+      tier: "backend"
+  action:
+    type: "pod-kill"
+    mode: "rolling"
+    rollingInterval: "60s"  # Kill one pod per minute
+    gracePeriodSeconds: 30
+  blastRadius:
+    unit: "percentage"
+    value: 25  # At most 25% of pods at any time
+    maxCount: 3  # Never kill more than 3 pods total
+  duration: "10m"
+  safety:
+    requireHealthyBefore: true
+    healthCheckEndpoints:
+      - "http://api-server.production.svc.cluster.local/health"
+    maxErrorRatePct: 5
+    minPodsAvailable: 2
+    requireHealthyAfter: true
+    autoRollback: true
+
+---
+# ─── Example 3: Network latency injection ─────────────────────────────────────
+# Tests whether your service mesh / timeouts are correctly configured.
+# A common finding: services use the default 30s HTTP timeout, which means
+# a latency spike causes request pile-up and OOM before the timeout fires.
+experiment:
+  name: "payment-service-network-latency"
+  description: "Inject network latency on payment service to test circuit breaker"
+  type: "network-latency"
+  target:
+    namespace: "production"
+    labelSelector:
+      app: "payment-service"
+  action:
+    type: "network-latency"
+    latencyMs: 200
+    jitterMs: 100
+    correlationPercent: 25
+    direction: "egress"  # Only outbound — simulates slow downstream dependency
+  blastRadius:
+    unit: "percentage"
+    value: 30
+  duration: "5m"
+  safety:
+    requireHealthyBefore: true
+    maxErrorRatePct: 2
+    maxLatencyMs: 1000
+    autoRollback: true
+
+---
+# ─── Example 4: Burst pod kill ──────────────────────────────────────────────
+# Simulates a node failure — all pods on a node die simultaneously.
+# Tests whether your HPA and cluster autoscaler react fast enough.
+experiment:
+  name: "zone-failure-simulation"
+  description: "Kill all pods of a deployment simultaneously (simulates AZ failure)"
+  type: "pod-kill"
+  target:
+    namespace: "production"
+    labelSelector:
+      app: "cache-service"
+  action:
+    type: "pod-kill"
+    mode: "burst"
+    gracePeriodSeconds: 0  # Immediate kill — simulates node failure
+  blastRadius:
+    unit: "percentage"
+    value: 30  # Kill 30% of pods simultaneously
+    maxCount: 5
+  duration: "2m"
+  safety:
+    requireHealthyBefore: true
+    maxErrorRatePct: 15  # Higher threshold — this IS a zone failure
+    autoRollback: true
+    recoveryTimeoutSeconds: 300
+  labels:
+    team: "platform"
+    severity: "high"
+
+---
+# ─── Example 5: Scheduled continuous chaos ──────────────────────────────────
+# Netflix-style continuous chaos: random pod kills during business hours.
+# The idea: if chaos happens every day, engineers fix the underlying issues
+# rather than relying on luck to avoid failures.
+experiment:
+  name: "continuous-random-chaos"
+  description: "Daily random chaos to keep engineers honest about resilience"
+  type: "pod-kill"
+  target:
+    namespace: "production"
+    labelSelector:
+      chaos-enabled: "true"  # Opt-in label
+  action:
+    type: "pod-kill"
+    mode: "random"
+    gracePeriodSeconds: 30
+  blastRadius:
+    unit: "count"
+    value: 1  # Kill exactly one pod
+  duration: "5m"
+  schedule: "0 14 * * 1-5"  # 2pm UTC on weekdays
+  safety:
+    requireHealthyBefore: true
+    maxErrorRatePct: 5
+    autoRollback: true
+  annotations:
+    "chaos.io/owner": "platform-team"
+    "chaos.io/runbook": "https://wiki.internal/chaos-runbook"
+
+---
+# ─── Example 6: RPC connection refused ──────────────────────────────────────
+# Tests whether your application falls back gracefully when an RPC node
+# completely refuses connections. A common failure mode in Solana validator
+# restarts and network partitions.
+experiment:
+  name: "solana-rpc-connection-refused"
+  description: "Simulate RPC node going completely offline"
+  type: "rpc-corrupt"
+  target:
+    rpcEndpoints:
+      - "http://solana-rpc-primary.internal:8899"
+  action:
+    type: "rpc-corrupt"
+    corruptionMode: "connection-refused"
+    errorRate: 1.0  # 100% of requests fail
+  blastRadius:
+    unit: "count"
+    value: 1  # Only one endpoint
+  duration: "3m"
+  safety:
+    requireHealthyBefore: true
+    requireHealthyAfter: true
+    maxErrorRatePct: 20  # 20% is acceptable — other endpoints should absorb traffic
+    autoRollback: true
+    recoveryTimeoutSeconds: 60
+
+---
+# ─── Example 7: CPU stress ────────────────────────────────────────────────────
+# Tests whether your resource limits and HPA are configured correctly.
+# Often reveals: services without CPU limits that starve neighbours,
+# or HPA that doesn't scale fast enough to handle CPU saturation.
+experiment:
+  name: "api-cpu-stress"
+  description: "Saturate CPU on API pods to test HPA and resource limit behavior"
+  type: "cpu-stress"
+  target:
+    namespace: "production"
+    labelSelector:
+      app: "api-server"
+  action:
+    type: "cpu-stress"
+    cpuLoadPercent: 90
+    workers: 2  # stress-ng workers
+  blastRadius:
+    unit: "percentage"
+    value: 20
+  duration: "5m"
+  safety:
+    requireHealthyBefore: true
+    maxErrorRatePct: 10
+    autoRollback: true

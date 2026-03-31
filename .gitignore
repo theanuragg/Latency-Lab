@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.next/
+*.env
+.env.local
+.env.*.local
+!.env.example
+
+# Build artifacts
+*.tsbuildinfo
+coverage/
+
+# Local dev
+*.log
+.turbo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# K8s secrets (never commit these)
+k8s/secrets/
+**/secrets.yaml
+**/secret.yaml

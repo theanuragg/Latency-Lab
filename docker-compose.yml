@@ -1,0 +1,211 @@
+# docker-compose.yml
+# Local development stack. Mirrors production topology without the K8s overhead.
+#
+# Services:
+#   control-plane    — the API server
+#   chaos-engine     — the execution worker
+#   rpc-proxy        — runs in front of a local mock Solana node
+#   postgres         — experiment state storage
+#   redis            — kill switch + proxy config
+#   nats             — event bus between control plane and engine
+#   prometheus       — metrics scraping
+#   grafana          — dashboards
+#   loki             — log aggregation
+#   promtail         — log shipper
+
+name: chaos-platform
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: chaosplatform
+      POSTGRES_USER: chaos
+      POSTGRES_PASSWORD: chaos-dev-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "chaos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+    ports:
+      - "6379:6379"
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js"]  # Enable JetStream for durable subscriptions
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # monitoring
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 10s
+
+  # ── Application services ──────────────────────────────────────────────────
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.control-plane
+    environment:
+      PORT: "3000"
+      DATABASE_URL: "postgresql://chaos:chaos-dev-password@postgres:5432/chaosplatform"
+      REDIS_URL: "redis://redis:6379"
+      NATS_URL: "nats://nats:4222"
+      JWT_SECRET: "dev-secret-change-in-production"
+      PROMETHEUS_URL: "http://prometheus:9090"
+      BLOCKED_NAMESPACES: "kube-system,kube-public,kube-node-lease"
+      MAX_BLAST_RADIUS_PCT: "30"
+      LOG_LEVEL: "debug"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:3000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  chaos-engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.chaos-engine
+    environment:
+      NATS_URL: "nats://nats:4222"
+      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgresql://chaos:chaos-dev-password@postgres:5432/chaosplatform"
+      PROMETHEUS_URL: "http://prometheus:9090"
+      # In local dev, point to the local K8s cluster via kubeconfig
+      KUBECONFIG: "/kube/config"
+    volumes:
+      - ~/.kube:/kube:ro  # Mount kubeconfig for local K8s access
+    depends_on:
+      - nats
+      - redis
+
+  rpc-proxy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rpc-proxy
+    environment:
+      TARGET_URL: "http://mock-solana:8899"
+      PORT: "9090"
+      REDIS_URL: "redis://redis:6379"
+      PROXY_ID: "local-solana-rpc"
+      LOG_LEVEL: "debug"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - redis
+
+  # Mock Solana RPC node (for local testing)
+  mock-solana:
+    image: node:20-alpine
+    command: ["node", "-e", "
+      const http = require('http');
+      http.createServer((req, res) => {
+        let body = '';
+        req.on('data', d => body += d);
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}');
+          res.writeHead(200, {'Content-Type': 'application/json'});
+          res.end(JSON.stringify({jsonrpc:'2.0',id:parsed.id||1,result:{slot:12345678}}));
+        });
+      }).listen(8899);
+      console.log('Mock Solana RPC on :8899');"
+    ]
+    ports:
+      - "8899:8899"
+
+  # ── Observability ─────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"  # Hot reload config
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-piechart-panel"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:3.0.0
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./docker/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./docker/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  # Next.js dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:3000"
+    ports:
+      - "3002:3000"
+    depends_on:
+      - control-plane
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

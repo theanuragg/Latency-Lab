@@ -1,0 +1,22 @@
+{
+  "name": "@chaos/rpc-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/proxy.ts",
+    "build": "tsc",
+    "start": "node dist/proxy.js"
+  },
+  "dependencies": {
+    "@chaos/shared-types": "*",
+    "fastify": "^4.27.0",
+    "ioredis": "^5.3.2",
+    "pino": "^9.1.0",
+    "prom-client": "^15.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

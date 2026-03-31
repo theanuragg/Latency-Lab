@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: chaos-platform
+
+resources:
+  - rbac/chaos-engine-rbac.yaml
+  - configmaps/chaos-config.yaml
+  - daemonsets/network-chaos-agent.yaml
+  - deployments/all.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: chaos-platform
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: ghcr.io/your-org/chaos-control-plane
+    newTag: latest
+  - name: ghcr.io/your-org/chaos-engine
+    newTag: latest
+  - name: ghcr.io/your-org/rpc-proxy
+    newTag: latest

@@ -1,0 +1,195 @@
+# k8s/configmaps/chaos-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-config
+  namespace: chaos-platform
+data:
+  nats-url: "nats://nats.chaos-platform.svc.cluster.local:4222"
+  prometheus-url: "http://prometheus.monitoring.svc.cluster.local:9090"
+  max-blast-radius-pct: "30"
+  blocked-namespaces: "kube-system,kube-public,kube-node-lease,chaos-platform"
+  log-level: "info"
+
+---
+# k8s/deployments/chaos-engine.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-engine
+  namespace: chaos-platform
+  labels:
+    app: chaos-engine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chaos-engine
+  template:
+    metadata:
+      labels:
+        app: chaos-engine
+      annotations:
+        "chaos.io/exclude": "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      serviceAccountName: chaos-engine
+      containers:
+        - name: engine
+          image: ghcr.io/your-org/chaos-engine:latest
+          env:
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: chaos-config
+                  key: nats-url
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: chaos-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: chaos-secrets
+                  key: redis-url
+            - name: PROMETHEUS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: chaos-config
+                  key: prometheus-url
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              # Check the NATS connection is alive
+              command: ["sh", "-c", "nc -z $NATS_HOST 4222"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+---
+# k8s/deployments/rpc-proxy.yaml
+# Deploy one RPC proxy per Solana RPC endpoint you want to test
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rpc-proxy-solana-primary
+  namespace: chaos-platform
+  labels:
+    app: rpc-proxy
+    target: solana-primary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rpc-proxy
+      target: solana-primary
+  template:
+    metadata:
+      labels:
+        app: rpc-proxy
+        target: solana-primary
+      annotations:
+        "chaos.io/exclude": "true"
+    spec:
+      containers:
+        - name: proxy
+          image: ghcr.io/your-org/rpc-proxy:latest
+          env:
+            - name: TARGET_URL
+              value: "http://solana-rpc-primary.solana.svc.cluster.local:8899"
+            - name: PORT
+              value: "9090"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: chaos-secrets
+                  key: redis-url
+            - name: PROXY_ID
+              value: "solana-primary"
+          ports:
+            - containerPort: 9090
+              name: proxy
+            - containerPort: 9092
+              name: metrics
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rpc-proxy-solana-primary
+  namespace: chaos-platform
+spec:
+  selector:
+    app: rpc-proxy
+    target: solana-primary
+  ports:
+    - name: proxy
+      port: 8899  # Expose on the standard Solana RPC port
+      targetPort: 9090
+    - name: metrics
+      port: 9092
+      targetPort: 9092
+
+---
+# k8s/deployments/nats.yaml
+# NATS server for the chaos platform message bus
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: chaos-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          args: ["-js", "-m", "8222"]
+          ports:
+            - containerPort: 4222
+              name: client
+            - containerPort: 8222
+              name: monitor
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: chaos-platform
+spec:
+  selector:
+    app: nats
+  ports:
+    - name: client
+      port: 4222
+    - name: monitor
+      port: 8222

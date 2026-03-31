@@ -1,0 +1,67 @@
+groups:
+  - name: chaos_safety
+    interval: 15s
+    rules:
+      # Fire when an experiment exceeds blast radius
+      - alert: ChaosBlastRadiusExceeded
+        expr: chaos_active_experiments > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of concurrent chaos experiments"
+          description: "{{ $value }} experiments are running simultaneously"
+
+      # Fire when auto-rollback rate is high (system is fragile)
+      - alert: HighChaosRollbackRate
+        expr: rate(chaos_experiments_rolled_back_total[15m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High chaos auto-rollback rate"
+          description: "Many experiments are triggering auto-rollback — system may be fragile"
+
+      # Fire when error rate spikes during experiments
+      - alert: ErrorRateSpikedDuringChaos
+        expr: |
+          (sum(rate(http_requests_total{status=~"5.."}[2m])) / sum(rate(http_requests_total[2m])) * 100) > 10
+          AND
+          sum(chaos_active_experiments) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 10% during active chaos experiment"
+          description: "Consider engaging kill switch if this is unintended"
+
+      # Fire when p99 latency triples during experiments
+      - alert: LatencySpikedDuringChaos
+        expr: |
+          (histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[2m])) by (le)) * 1000) > 2000
+          AND
+          sum(chaos_active_experiments) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency > 2s during active chaos experiment"
+
+  - name: chaos_platform_health
+    rules:
+      # The chaos platform itself should be healthy
+      - alert: ChaosPlatformDown
+        expr: up{job="chaos-control-plane"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chaos control plane is down"
+
+      - alert: ChaosEngineDown
+        expr: up{job="chaos-engine"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chaos engine worker is down — experiments will not execute"

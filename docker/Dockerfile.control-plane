@@ -1,0 +1,24 @@
+# docker/Dockerfile.control-plane
+FROM node:20-alpine AS base
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json turbo.json ./
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY packages/control-plane/package.json ./packages/control-plane/
+RUN npm install --workspaces --include-workspace-root
+
+FROM base AS builder
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build --workspace=packages/control-plane 2>/dev/null || true
+
+FROM base AS runner
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/packages/shared-types ./packages/shared-types
+COPY --from=builder /app/packages/control-plane ./packages/control-plane
+
+EXPOSE 3000
+CMD ["node", "--require", "tsx/cjs", "packages/control-plane/src/server.ts"]
