@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "tsx watch src/proxy.ts",
-    "build": "tsc",
-    "start": "node dist/proxy.js"
+    "dev": "node init && tsx watch src/proxy.ts",
+    "build": "node init && tsc",
+    "start": "node init && node dist/proxy.js"
   },
   "dependencies": {
     "@chaos/shared-types": "*",

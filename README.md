@@ -1,260 +1,344 @@
-# Chaos Platform — Production Chaos Engineering for Kubernetes + Solana
+# Chaos Platform
 
-A production-grade chaos engineering platform built to the same standards as Netflix Chaos Monkey, but purpose-built for modern Kubernetes + RPC-heavy (Solana) infrastructure.
+Chaos Platform is a distributed chaos engineering system for Kubernetes and RPC-heavy infrastructure. It is designed so operators can define controlled failure experiments, route them through safety checks, execute them in workers, and measure whether the platform recovers inside acceptable limits.
 
----
+This README explains how the platform works using Mermaid data-flow diagrams and architecture notes instead of implementation examples.
 
-## Architecture
+## What This Platform Does
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Layer                             │
-│   chaosctl CLI  ·  Next.js Dashboard  ·  CI/CD  ·  Webhooks   │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ REST API (JWT-authenticated)
-┌─────────────────────────▼───────────────────────────────────────┐
-│                    Control Plane (Axum/Fastify)                  │
-│  Experiment API  ·  Policy Engine  ·  Kill Switch  ·  Scheduler │
-│               PostgreSQL (state) · Redis (kill switch)           │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ NATS pub/sub
-┌─────────────────────────▼───────────────────────────────────────┐
-│                     Chaos Engine (Workers)                       │
-│    Pod Kill Runner  ·  Network Chaos  ·  RPC Proxy  ·  Stress   │
-│              Health Checker  ·  Metrics Collector               │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ Kubernetes API / tc-netem / Redis
-┌─────────────────────────▼───────────────────────────────────────┐
-│                    Target Infrastructure                          │
-│    K8s Pods/Nodes  ·  Solana RPC Nodes  ·  Services  ·  DBs    │
-└─────────────────────────────────────────────────────────────────┘
-                          ↕ (all layers emit)
-┌─────────────────────────────────────────────────────────────────┐
-│                       Observability                              │
-│         Prometheus  ·  Grafana  ·  OpenTelemetry  ·  Loki      │
-└─────────────────────────────────────────────────────────────────┘
-```
+- Accepts chaos experiment requests from operators, dashboards, CI systems, or automation.
+- Validates each request through policy, kill-switch, health, and blast-radius controls.
+- Publishes approved work to an execution layer instead of running chaos directly from the API.
+- Executes different failure modes against Kubernetes workloads, nodes, dependencies, and RPC paths.
+- Measures impact, recovery, and resilience outcomes through metrics and experiment events.
 
----
+## Core Idea
 
-## Key Design Decisions
+The platform is split into a control plane and an execution plane.
 
-### 1. Control plane ↔ Engine decoupling via NATS
+- The control plane decides whether chaos should happen.
+- The chaos engine decides how chaos is carried out.
+- Redis is the fast safety path for stopping chaos.
+- NATS is the decoupling path between decision-making and execution.
+- PostgreSQL stores experiment state and history.
+- Prometheus, Grafana, and Loki show what happened and how the system recovered.
 
-The control plane never directly executes chaos. It publishes to NATS; workers consume. This means:
-- Control plane restarts don't abort running experiments
-- Multiple engine workers can run different experiment types in parallel
-- The kill switch works even when the control plane is degraded
+## System Context
 
-### 2. Kill switch is Redis-first, not API-first
+```mermaid
+flowchart LR
+    U[Operators / SRE / CI] --> CLI[CLI]
+    U --> UI[Dashboard]
+    U --> APIClients[Automation / Webhooks]
 
-Workers check Redis directly, bypassing the control plane. A Redis write propagates to workers within ~1 second regardless of API health. The global kill switch is the single most important safety feature — it must work when everything else is broken.
+    CLI --> CP[Control Plane]
+    UI --> CP
+    APIClients --> CP
 
-### 3. Policy engine is composable validators
+    CP --> PG[(PostgreSQL)]
+    CP --> R[(Redis Kill Switch)]
+    CP --> N[NATS]
 
-Adding a new safety rule = add one function. The policy system runs all validators in parallel and aggregates violations. Hard blocks prevent execution; warnings are surfaced to the operator but don't block.
+    N --> CE[Chaos Engine Workers]
+    CE --> K8S[Kubernetes API]
+    CE --> TARGETS[Pods / Nodes / Services / Dependencies]
+    CE --> RPCP[RPC Proxy]
 
-### 4. PodDisruptionBudget awareness is mandatory
+    RPCP --> RPC[Real RPC Endpoints]
 
-Every pod-kill action checks PDBs before killing. If a PDB says `disruptionsAllowed: 0`, we skip that pod. This respects the application's own declared availability requirements.
+    CP --> OBS[Observability Stack]
+    CE --> OBS
+    RPCP --> OBS
 
-### 5. MTTR is a first-class metric
-
-After every experiment, we poll for system recovery and compute Mean Time To Recovery. This is the most actionable chaos metric — it tells you whether your runbooks, alerts, and auto-healing work.
-
----
-
-## Monorepo Structure
-
-```
-chaos-platform/
-├── packages/
-│   ├── shared-types/        # Cross-service TypeScript contracts
-│   ├── control-plane/       # API server (Fastify + PostgreSQL)
-│   │   └── src/
-│   │       ├── api/         # REST routes (experiments, kill-switch, metrics)
-│   │       ├── engine/      # Kill switch service, K8s client
-│   │       ├── policy/      # Policy engine with composable validators
-│   │       ├── scheduler/   # Cron-based recurring experiments
-│   │       └── observability/
-│   ├── chaos-engine/        # Execution workers
-│   │   └── src/
-│   │       ├── runners/     # Pod kill, network chaos, RPC proxy, stress
-│   │       ├── health/      # Pre/post health checking
-│   │       └── observability/
-│   ├── rpc-proxy/           # Standalone RPC chaos proxy (Solana-ready)
-│   ├── cli/                 # chaosctl command-line interface
-│   └── dashboard/           # Next.js operational dashboard
-├── k8s/
-│   ├── rbac/                # ServiceAccount, ClusterRole, CRB
-│   ├── daemonsets/          # Network chaos agent (NET_ADMIN)
-│   ├── deployments/         # Control plane, chaos engine
-│   └── configmaps/
-├── experiments/
-│   └── examples.yaml        # 7 annotated example experiments
-├── docker/
-│   ├── init.sql             # PostgreSQL schema
-│   ├── prometheus.yml       # Scrape config
-│   └── grafana/             # Dashboard provisioning
-└── docker-compose.yml       # Full local stack
+    OBS --> G[Grafana / Metrics / Logs]
 ```
 
----
+## How It Works
 
-## Supported Chaos Types
+The system flow is intentionally staged. A request is not allowed to jump directly from the API into destructive action.
 
-| Type | Implementation | Notes |
-|------|---------------|-------|
-| `pod-kill` | Kubernetes DELETE pod API | PDB-aware, random/rolling/burst modes |
-| `network-latency` | tc/netem inside pod | DaemonSet agent for host-level control |
-| `network-loss` | tc/netem | Configurable packet loss + correlation |
-| `network-partition` | iptables + ipset | Block traffic between specific services |
-| `rpc-latency` | RPC chaos proxy | Solana JSON-RPC aware |
-| `rpc-timeout` | RPC chaos proxy | Hangs connection until client timeout |
-| `rpc-corrupt` | RPC chaos proxy | Invalid JSON, truncate, wrong-method |
-| `cpu-stress` | stress-ng exec | Configurable load %, workers |
-| `memory-exhaust` | stress-ng exec | Configurable bytes, workers |
-| `disk-throttle` | stress-ng exec | Sequential I/O stress |
-| `node-drain` | K8s node taint | Simulates AZ failure |
-| `dependency-kill` | iptables block | DB/Redis/cache outage simulation |
-
----
-
-## Safety System (Non-Negotiable)
-
-Every experiment goes through this gauntlet before execution:
-
-```
-Request → Zod validation → Policy engine → Kill switch check
-       → Pre-flight health → PDB check → Blast radius cap
-       → Execute with monitoring → Auto-rollback threshold
-       → Post-chaos health wait → MTTR calculation
+```mermaid
+flowchart TD
+    A[User creates experiment] --> B[Control Plane receives request]
+    B --> C[Schema and request validation]
+    C --> D[Policy Engine evaluation]
+    D --> E[Kill Switch check]
+    E --> F[Persist experiment in PostgreSQL]
+    F --> G{Scheduled or immediate?}
+    G -->|Scheduled| H[Scheduler waits for cron window]
+    G -->|Immediate| I[Publish start event to NATS]
+    H --> I
+    I --> J[Chaos Engine subscribes]
+    J --> K[Pre-flight health checks]
+    K --> L[Target selection]
+    L --> M[Experiment execution]
+    M --> N[Continuous safety monitoring]
+    N --> O{Threshold exceeded?}
+    O -->|Yes| P[Rollback / cleanup]
+    O -->|No| Q[Normal cleanup]
+    P --> R[Recovery wait]
+    Q --> R
+    R --> S[Capture final metrics]
+    S --> T[Store events, MTTR, chaos score]
+    T --> U[Dashboard and observability show results]
 ```
 
-**Blast radius maximum**: Configurable globally, default 30%. Cannot be overridden by experiment config.
+## Main Components
 
-**Blocked namespaces**: `kube-system`, `kube-public`, `kube-node-lease` are permanently blocked. Additional namespaces configurable at deploy time.
+### 1. Control Plane
 
-**Auto-rollback**: If error rate or p99 latency exceeds configured thresholds during an experiment, chaos is cleaned up automatically and the status is set to `rolled-back`.
+The control plane is the decision layer. It exposes the API, validates requests, enforces policy, stores state, manages schedules, and blocks new work when the kill switch is active.
 
----
+Its responsibilities are:
 
-## Local Development
+- authenticate and authorize requests
+- validate experiment structure
+- evaluate policy rules
+- reject blocked namespaces or invalid blast radius
+- persist experiment records and event history
+- schedule recurring experiments
+- publish approved experiments to NATS
 
-```bash
-# Start the full stack (Postgres, Redis, NATS, Prometheus, Grafana, all services)
-docker compose up -d
+The control plane does not directly inject failures into workloads. That separation is deliberate so API restarts do not terminate running experiments.
 
-# Verify everything is healthy
-docker compose ps
+### 2. Chaos Engine
 
-# Configure chaosctl
-chaosctl login --endpoint http://localhost:3000 --token dev-token
+The chaos engine is the execution layer. It consumes work from NATS and runs the appropriate runner for the requested experiment type.
 
-# Run a dry-run to see what would happen
-chaosctl dry-run -f experiments/examples.yaml
+Its responsibilities are:
 
-# Run your first experiment (RPC latency against mock Solana)
-chaosctl apply -f experiments/examples.yaml
+- receive approved experiment start messages
+- perform pre-flight health checks
+- select eligible targets
+- inject failure using the correct runner
+- monitor error rate and latency during the run
+- stop early when safety conditions fail
+- clean up and wait for recovery
+- compute metrics and resilience outcomes
 
-# Watch it live
-chaosctl get experiments
+### 3. RPC Proxy
 
-# Open the dashboard
-open http://localhost:3002
+The RPC proxy is a specialized failure-injection point for RPC traffic. It sits between clients and real RPC infrastructure and can inject latency, timeout, corruption, or dropped traffic without changing application code.
 
-# Open Grafana (admin/admin)
-open http://localhost:3001
+This is important for Solana-style systems where RPC behavior is a critical dependency and outages often happen in the request path rather than only in pods or nodes.
+
+### 4. Data Stores and Messaging
+
+- PostgreSQL is the source of truth for experiments, status, targets, events, and audit history.
+- Redis is the fast control channel for kill-switch state and proxy configuration.
+- NATS is the event bridge between orchestration and execution.
+
+## Request and Decision Flow
+
+```mermaid
+flowchart LR
+    REQ[Experiment Request] --> AUTH[Auth and RBAC]
+    AUTH --> VALID[Validation]
+    VALID --> POLICY[Policy Engine]
+    POLICY --> KS[Kill Switch Gate]
+    KS --> DBWRITE[Write pending experiment]
+    DBWRITE --> DISPATCH[Dispatch to NATS]
+    DISPATCH --> WORKER[Chaos Engine Worker]
 ```
 
----
+This path matters because it creates clean separation between:
 
-## Kubernetes Deployment
+- who requested the change
+- whether the change is allowed
+- when the change should run
+- which worker executes it
 
-```bash
-# Create namespace and secrets
-kubectl create namespace chaos-platform
-kubectl create secret generic chaos-secrets \
-  --from-literal=database-url="postgresql://..." \
-  --from-literal=redis-url="redis://..." \
-  --from-literal=jwt-secret="$(openssl rand -hex 32)" \
-  -n chaos-platform
+## Safety Flow
 
-# Apply RBAC (do this before the deployments — RBAC is a prerequisite)
-kubectl apply -f k8s/rbac/
+Safety is the most important design concern in this project. The platform assumes chaos must be stoppable even when other services are degraded.
 
-# Deploy the network chaos DaemonSet (requires NET_ADMIN — review before applying)
-kubectl apply -f k8s/daemonsets/
-
-# Deploy control plane + engine
-kubectl apply -f k8s/deployments/
-
-# Verify
-kubectl get pods -n chaos-platform
+```mermaid
+flowchart TD
+    START[Experiment requested] --> P1[Policy validation]
+    P1 --> P2[Blocked namespace check]
+    P2 --> P3[Blast radius cap check]
+    P3 --> P4[Kill switch state check]
+    P4 --> P5[Pre-flight health verification]
+    P5 --> P6[Eligible target selection]
+    P6 --> P7[PDB and availability awareness]
+    P7 --> EXEC[Run experiment]
+    EXEC --> MON[Monitor health and latency]
+    MON --> DECIDE{Unsafe impact detected?}
+    DECIDE -->|Yes| RB[Immediate rollback / cleanup]
+    DECIDE -->|No| DONE[Complete planned duration]
+    RB --> REC[Wait for recovery]
+    DONE --> REC
+    REC --> END[Finalize metrics and status]
 ```
 
----
+### Safety Principles
 
-## Adding a New Chaos Type
+- Global kill switch can stop new and active chaos across the platform.
+- Namespace and experiment scoped kill switches reduce blast radius without halting all work.
+- Workers check kill-switch state directly through Redis so safety does not depend on control-plane health.
+- Blocked namespaces protect critical cluster infrastructure.
+- Blast radius has a hard upper limit and should not be bypassed by experiment input.
+- Health checks before and after execution prevent running chaos against already degraded systems.
+- Runtime monitoring can trigger rollback if error-rate or latency thresholds are crossed.
 
-1. Create `packages/chaos-engine/src/runners/my-chaos.ts` implementing:
-   - `selectTargets(config): Promise<SelectedTarget[]>`
-   - `execute(config, targets, callbacks): Promise<void>`
-   - `cleanup(config, targets): Promise<void>`
+## Kill Switch Data Flow
 
-2. Register in `packages/chaos-engine/src/worker.ts`:
-   ```ts
-   import { MyChaosRunner } from "./runners/my-chaos";
-   const runners = {
-     ...existing,
-     "my-chaos-type": new MyChaosRunner(),
-   };
-   ```
+```mermaid
+flowchart LR
+    OP[Operator] --> KSAPI[Kill Switch API]
+    KSAPI --> R[(Redis)]
+    KSAPI --> AUDIT[(PostgreSQL Audit)]
+    R --> CP[Control Plane Gate]
+    R --> CE[Chaos Engine Workers]
+    R --> RPCP[RPC Proxy Config]
+```
 
-3. Add the type to `ExperimentType` union in `packages/shared-types/src/index.ts`
+Why this matters:
 
-4. Add a YAML example to `experiments/examples.yaml`
+- Redis provides a low-latency shared state for fast stop decisions.
+- Workers do not need to wait for the API to respond before stopping work.
+- Audit records still go to PostgreSQL so every engage and disengage event is reviewable later.
 
-That's it. The policy engine, kill switch, health checking, and metrics collection are all automatic.
+## Execution Lifecycle
 
----
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> scheduled
+    pending --> running
+    scheduled --> running
+    running --> paused
+    paused --> running
+    running --> completed
+    running --> rolled_back
+    running --> failed
+    running --> killed
+    rolled_back --> [*]
+    completed --> [*]
+    failed --> [*]
+    killed --> [*]
+```
 
-## Chaos Score
+### What Each State Means
 
-The chaos score (0-100) measures how resilient the system was during an experiment:
+- `pending`: accepted and stored, but not yet handed to a worker
+- `scheduled`: waiting for a cron window
+- `running`: active failure injection or active monitoring
+- `paused`: execution intentionally suspended
+- `rolled_back`: safety logic triggered cleanup before normal completion
+- `completed`: duration ended and cleanup finished
+- `failed`: execution could not proceed or ended with an unrecoverable error
+- `killed`: manually stopped by operator action
 
-| Component | Weight | Measures |
-|-----------|--------|---------|
-| Error rate delta | 40% | Did errors spike? |
-| p99 latency delta | 30% | Did latency spike? |
-| Recovery speed | 20% | How fast did MTTR complete? |
-| Pod availability | 10% | Did pods stay healthy? |
+## Observability Flow
 
-Track scores over time to build a resilience trend. The goal is a steadily rising score as the team fixes the issues chaos reveals.
+```mermaid
+flowchart LR
+    CP[Control Plane] --> METRICS[Prometheus Metrics]
+    CE[Chaos Engine] --> METRICS
+    RPCP[RPC Proxy] --> METRICS
 
----
+    CP --> LOGS[Loki / Structured Logs]
+    CE --> LOGS
+    RPCP --> LOGS
 
-## RBAC Roles
+    METRICS --> GRAF[Grafana]
+    LOGS --> GRAF
+    DB[(PostgreSQL)] --> DASH[Dashboard]
+    GRAF --> USERS[Operators]
+    DASH --> USERS
+```
 
-| Role | Permissions |
-|------|------------|
-| `chaos-viewer` | Read experiments, metrics, audit log |
-| `chaos-operator` | Create/pause/kill experiments, namespace kill switch |
-| `chaos-admin` | Global kill switch, delete schedules, manage RBAC |
+The platform is not only meant to inject failure. It is meant to explain:
 
----
+- what started
+- what was targeted
+- what impact was observed
+- whether rollback was needed
+- how long recovery took
 
-## Environment Variables
+## Data Model at a High Level
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `DATABASE_URL` | ✓ | — | PostgreSQL connection string |
-| `REDIS_URL` | ✓ | — | Redis connection string |
-| `NATS_URL` | ✓ | nats://localhost:4222 | NATS server |
-| `JWT_SECRET` | ✓ | — | JWT signing secret (min 32 chars) |
-| `PROMETHEUS_URL` | — | http://prometheus:9090 | For metrics collection |
-| `MAX_BLAST_RADIUS_PCT` | — | 30 | Hard cap on blast radius (%) |
-| `BLOCKED_NAMESPACES` | — | kube-system,... | Comma-separated blocked namespaces |
-| `PORT` | — | 3000 | Control plane HTTP port |
-| `TARGET_URL` | — | — | RPC proxy target (rpc-proxy only) |
-| `PROXY_ID` | — | default | RPC proxy identifier in Redis |
+```mermaid
+flowchart TD
+    EXP[Experiment Definition] --> ST[Status History]
+    EXP --> TG[Selected Targets]
+    EXP --> EV[Execution Events]
+    EXP --> MT[Metrics Snapshot]
+    EXP --> AU[Audit and Kill Switch Records]
+```
+
+Each experiment should leave behind an operational record, not just a final status. That record is what lets teams compare resilience over time.
+
+## Supported Failure Domains
+
+| Domain | Intent | Typical Target |
+|---|---|---|
+| Pod disruption | Remove workload instances | Pods, deployments |
+| Network impairment | Add latency, loss, or partitions | Pods, services, namespaces |
+| RPC path chaos | Distort request and response behavior | Solana or other RPC consumers |
+| Resource stress | Consume CPU, memory, or disk | Pods or nodes |
+| Node disruption | Simulate infrastructure degradation | Kubernetes nodes |
+| Dependency isolation | Break access to downstream systems | Databases, Redis, caches, APIs |
+
+## Package Roles
+
+| Package | Role in the platform |
+|---|---|
+| `packages/control-plane` | API, policy engine, scheduler, kill-switch endpoints, metrics routes |
+| `packages/chaos-engine` | Worker runtime, runners, health checks, metrics collection, rollback |
+| `packages/rpc-proxy` | RPC traffic failure injection layer |
+| `packages/dashboard` | Operator-facing UI for status and resilience views |
+| `packages/cli` | Command-line operator workflow |
+| `packages/shared-types` | Shared contracts across services |
+
+## Monorepo View
+
+```mermaid
+flowchart TD
+    ROOT[chaos-platform] --> PKG[packages]
+    ROOT --> K8S[k8s]
+    ROOT --> DOCKER[docker]
+    ROOT --> EXP[experiments]
+
+    PKG --> CP[control-plane]
+    PKG --> CE[chaos-engine]
+    PKG --> RP[rpc-proxy]
+    PKG --> CLI[cli]
+    PKG --> UI[dashboard]
+    PKG --> ST[shared-types]
+```
+
+## Why This Architecture Works
+
+### Decoupled execution
+
+The API accepts and governs requests, but workers execute them asynchronously. This keeps the orchestration path clean and makes the system more resilient to partial failures.
+
+### Fast safety path
+
+The kill switch is not buried behind slow control logic. Redis gives workers a direct path to discover that chaos must stop.
+
+### Measurable outcomes
+
+The platform treats MTTR, error-rate change, latency change, and health recovery as core outputs, not side effects.
+
+### Support for real production patterns
+
+Many failures in modern systems happen in dependencies, traffic paths, or overloaded infrastructure, not just in pods. The architecture reflects that by supporting both Kubernetes-native and RPC-path experiments.
+
+## How To Read This Platform
+
+If you are new to the repo, read it in this order:
+
+1. Start with the control plane because it defines the approval path.
+2. Move to the chaos engine because it defines the execution path.
+3. Review the kill-switch flow because it defines the safety model.
+4. Review the RPC proxy if your workloads depend on RPC behavior.
+5. Use the dashboard and metrics views to understand outcomes, not just activity.
+
+## Summary
+
+Chaos Platform is built around one operating principle: controlled failure must be easier to stop, observe, and explain than it is to start.
+
+The architecture supports that principle by separating control from execution, putting safety on a fast shared path, and capturing operational evidence after every run.
